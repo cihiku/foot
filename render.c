@@ -1883,6 +1883,14 @@ render_ime_preedit_for_seat(struct terminal *term, struct seat *seat,
     const int damage_w = cells_used * term->cell_width;
     const int damage_h = term->cell_height;
 
+    if (buf->present_data != NULL) {
+        pixman_region32_t ime_region;
+        pixman_region32_init_rect(
+            &ime_region, damage_x, damage_y, damage_w, damage_h);
+        shm_encode_present(buf, &ime_region);
+        pixman_region32_fini(&ime_region);
+    }
+
     wl_surface_damage_buffer(
         term->window->surface.surf,
         damage_x, damage_y, damage_w, damage_h);
@@ -2164,6 +2172,7 @@ render_overlay(struct terminal *term)
     wayl_surface_scale(
         term->window, &overlay->surface, buf, term->scale);
     wl_subsurface_set_position(overlay->sub, 0, 0);
+    shm_encode_present(buf, NULL);
     wl_surface_attach(overlay->surface.surf, buf->wl_buf, 0, 0);
 
     wl_surface_damage_buffer(
@@ -2389,6 +2398,7 @@ static void
 csd_commit(struct terminal *term, struct wayl_surface *surf, struct buffer *buf)
 {
     wayl_surface_scale(term->window, surf, buf, term->scale);
+    shm_encode_present(buf, NULL);
     wl_surface_attach(surf->surf, buf->wl_buf, 0, 0);
     wl_surface_damage_buffer(surf->surf, 0, 0, buf->width, buf->height);
     wl_surface_commit(surf->surf);
@@ -2492,6 +2502,7 @@ render_osd(struct terminal *term, const struct wayl_sub_surface *sub_surf,
 
     quirk_weston_subsurface_desync_on(sub_surf->sub);
     wayl_surface_scale(term->window, &sub_surf->surface, buf, term->scale);
+    shm_encode_present(buf, NULL);
     wl_surface_attach(sub_surf->surface.surf, buf->wl_buf, 0, 0);
     wl_surface_damage_buffer(sub_surf->surface.surf, 0, 0, buf->width, buf->height);
 
@@ -3195,12 +3206,17 @@ force_full_repaint(struct terminal *term, struct buffer *buf)
 }
 
 static void
-reapply_old_damage(struct terminal *term, struct buffer *new, struct buffer *old)
+reapply_old_damage(struct terminal *term, struct buffer *new, struct buffer *old,
+                   pixman_region32_t *reapplied)
 {
     if (new->age > 1) {
         memcpy(new->data, old->data, new->height * new->stride);
+        pixman_region32_union_rect(
+            reapplied, reapplied, 0, 0, new->width, new->height);
         return;
     }
+
+    pixman_region32_union(reapplied, reapplied, &old->dirty[0]);
 
     pixman_region32_t dirty;
     pixman_region32_init(&dirty);
@@ -3349,6 +3365,9 @@ grid_render(struct terminal *term)
     struct buffer_chain *chain = term->render.chains.grid;
     struct buffer *buf = shm_get_buffer(chain, term->width, term->height);
 
+    pixman_region32_t encode_region;
+    pixman_region32_init(&encode_region);
+
     /* Dirty old and current cursor cell, to ensure they're repainted */
     dirty_old_cursor(term);
     dirty_cursor(term);
@@ -3388,7 +3407,7 @@ grid_render(struct terminal *term)
         }
 
         clock_gettime(CLOCK_MONOTONIC, &start_double_buffering);
-        reapply_old_damage(term, buf, term->render.last_buf);
+        reapply_old_damage(term, buf, term->render.last_buf, &encode_region);
         clock_gettime(CLOCK_MONOTONIC, &stop_double_buffering);
     } else if (!term->render.preapply_last_frame_damage) {
         term->render.frames_since_last_immediate_release = 0;
@@ -3597,6 +3616,8 @@ grid_render(struct terminal *term)
 
     pixman_region32_union(&buf->dirty[0], &buf->dirty[0], &damage);
 
+    pixman_region32_union(&encode_region, &encode_region, &buf->dirty[0]);
+
     {
         int box_count = 0;
         pixman_box32_t *boxes = pixman_region32_rectangles(&damage, &box_count);
@@ -3712,6 +3733,9 @@ grid_render(struct terminal *term)
         wl_surface_damage_buffer(
             term->window->surface.surf, 0, 0, INT32_MAX, INT32_MAX);
     }
+
+    shm_encode_present(buf, &encode_region);
+    pixman_region32_fini(&encode_region);
 
     wl_surface_attach(term->window->surface.surf, buf->wl_buf, 0, 0);
     wl_surface_commit(term->window->surface.surf);
@@ -4043,6 +4067,7 @@ render_search_box(struct terminal *term)
         roundf(max(0, (int32_t)term->height - height - margin) / scale));
 
     wayl_surface_scale(term->window, &term->window->search.surface, buf, scale);
+    shm_encode_present(buf, NULL);
     wl_surface_attach(term->window->search.surface.surf, buf->wl_buf, 0, 0);
     wl_surface_damage_buffer(term->window->search.surface.surf, 0, 0, width, height);
 

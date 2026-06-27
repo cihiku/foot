@@ -208,11 +208,13 @@ enum shm_bit_depth shm_chain_bit_depth(const struct buffer_chain *chain) { retur
 struct buffer_chain *
 shm_chain_new(
     struct wayland *wayl, bool scrollable, size_t pix_instances,
-    enum shm_bit_depth desired_bit_depth,
+    enum shm_bit_depth desired_bit_depth, bool self_encode,
     void (*release_cb)(struct buffer *buf, void *data), void *cb_data)
 {
     return NULL;
 }
+
+void shm_encode_present(struct buffer *buf, const pixman_region32_t *region) {}
 
 
 void search_selection_cancelled(struct terminal *term) {}

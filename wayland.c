@@ -2141,6 +2141,7 @@ wayl_win_init(struct terminal *term, const char *token)
         xdg_toplevel_icon_v1_destroy(icon);
     }
 
+#if !defined(HAVE_PIXMAN_RGBA_16)
     if (term->conf->gamma_correct) {
         if (wayl->color_management.img_description != NULL) {
             xassert(wayl->color_management.manager != NULL);
@@ -2168,6 +2169,7 @@ wayl_win_init(struct terminal *term, const char *token)
             }
         }
     }
+#endif
 
     if (conf->csd.preferred == CONF_CSD_PREFER_NONE) {
         /* User specifically do *not* want decorations */
@@ -2879,6 +2881,12 @@ wayl_activate(struct wayland *wayl, struct wl_window *win, const char *token)
 bool
 wayl_do_linear_blending(const struct wayland *wayl, const struct config *conf)
 {
+#if defined(HAVE_PIXMAN_RGBA_16)
+    (void)wayl;
+    return conf->gamma_correct;
+#else
+    /* Legacy ext_linear path: requires compositor color management. */
     return conf->gamma_correct &&
            wayl->color_management.img_description != NULL;
+#endif
 }

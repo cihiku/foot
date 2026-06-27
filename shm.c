@@ -22,6 +22,8 @@
 #include "macros.h"
 #include "stride.h"
 #include "xmalloc.h"
+#include "srgb.h"
+#include "util.h"
 
 #if !defined(MAP_UNINITIALIZED)
  #define MAP_UNINITIALIZED 0
@@ -97,7 +99,10 @@ struct buffer_chain {
     size_t pix_instances;
     bool scrollable;
 
+    bool self_encode;
+
     pixman_format_code_t pixman_fmt;
+    pixman_format_code_t present_fmt;
     enum wl_shm_format shm_format;
 
     void (*release_cb)(struct buffer *buf, void *data);
@@ -139,6 +144,7 @@ buffer_destroy_dont_close(struct buffer *buf)
     buf->pix = NULL;
     buf->wl_buf = NULL;
     buf->data = NULL;
+    buf->present_data = NULL;
 }
 
 static void
@@ -278,9 +284,21 @@ instantiate_offset(struct buffer_private *buf, off_t new_offset)
 
     mmapped = (uint8_t *)pool->real_mmapped + new_offset;
 
+    const bool self_encode = buf->chain->self_encode;
+    const size_t render_size = buf->public.stride * buf->public.height;
+    void *present = self_encode
+        ? (uint8_t *)mmapped + render_size
+        : mmapped;
+    const off_t present_offset = self_encode
+        ? new_offset + render_size
+        : new_offset;
+    const int present_stride = self_encode
+        ? buf->public.present_stride
+        : buf->public.stride;
+
     wl_buf = wl_shm_pool_create_buffer(
-        pool->wl_pool, new_offset,
-        buf->public.width, buf->public.height, buf->public.stride,
+        pool->wl_pool, present_offset,
+        buf->public.width, buf->public.height, present_stride,
         buf->chain->shm_format);
 
     if (wl_buf == NULL) {
@@ -304,6 +322,7 @@ instantiate_offset(struct buffer_private *buf, off_t new_offset)
     buf->public.data = mmapped;
     buf->public.wl_buf = wl_buf;
     buf->public.pix = pix;
+    buf->public.present_data = self_encode ? present : NULL;
     buf->offset = new_offset;
 
     wl_buffer_add_listener(wl_buf, &buffer_listener, buf);
@@ -340,20 +359,26 @@ get_new_buffers(struct buffer_chain *chain, size_t count,
      */
 
     int stride[count];
+    int present_stride[count];
     int sizes[count];
 
     size_t total_size = 0;
     for (size_t i = 0; i < count; i++) {
         stride[i] = stride_for_format_and_width(
             chain->pixman_fmt, widths[i]);
+        present_stride[i] = chain->self_encode
+            ? stride_for_format_and_width(chain->present_fmt, widths[i])
+            : 0;
 
         if (min_stride_alignment > 0) {
             const size_t m = min_stride_alignment;
             stride[i] = (stride[i] + m - 1) / m * m;
+            if (present_stride[i] > 0)
+                present_stride[i] = (present_stride[i] + m - 1) / m * m;
         }
 
         xassert(min_stride_alignment == 0 || stride[i] % min_stride_alignment == 0);
-        sizes[i] = stride[i] * heights[i];
+        sizes[i] = (stride[i] + present_stride[i]) * heights[i];
         total_size += sizes[i];
     }
     if (total_size == 0)
@@ -504,6 +529,7 @@ get_new_buffers(struct buffer_chain *chain, size_t count,
                 .width = widths[i],
                 .height = heights[i],
                 .stride = stride[i],
+                .present_stride = present_stride[i],
                 .pix_instances = chain->pix_instances,
                 .age = 1234,  /* Force a full repaint */
             },
@@ -658,7 +684,8 @@ shm_can_scroll(const struct buffer *_buf)
 {
 #if __SIZEOF_POINTER__ == 8
     const struct buffer_private *buf = (const struct buffer_private *)_buf;
-    return can_punch_hole && max_pool_size > 0 && buf->scrollable;
+    return can_punch_hole && max_pool_size > 0 && buf->scrollable &&
+           !buf->chain->self_encode;
 #else
     /* Not enough virtual address space in 32-bit */
     return false;
@@ -992,74 +1019,96 @@ shm_unref(struct buffer *_buf)
 
 struct buffer_chain *
 shm_chain_new(struct wayland *wayl, bool scrollable, size_t pix_instances,
-              enum shm_bit_depth desired_bit_depth,
+              enum shm_bit_depth desired_bit_depth, bool self_encode,
               void (*release_cb)(struct buffer *buf, void *data), void *cb_data)
 {
     pixman_format_code_t pixman_fmt = PIXMAN_a8r8g8b8;
+    pixman_format_code_t present_fmt = PIXMAN_a8r8g8b8;
     enum wl_shm_format shm_fmt = WL_SHM_FORMAT_ARGB8888;
 
     static bool have_logged = false;
     static bool have_logged_10_fallback = false;
 
-#if defined(HAVE_PIXMAN_RGBA_16)
-    static bool have_logged_16_fallback = false;
-
-    if (desired_bit_depth == SHM_BITS_16) {
-        if (wayl->shm_have_abgr161616) {
-            pixman_fmt = PIXMAN_a16b16g16r16;
-            shm_fmt = WL_SHM_FORMAT_ABGR16161616;
-
-            if (!have_logged) {
-                have_logged = true;
-                LOG_INFO("using 16-bit BGR surfaces");
-            }
-        } else {
-            if (!have_logged_16_fallback) {
-                have_logged_16_fallback = true;
-
-                LOG_WARN(
-                    "16-bit surfaces requested, but compositor does not "
-                    "implement ABGR161616+XBGR161616");
-            }
-        }
-    }
+#if !defined(HAVE_PIXMAN_RGBA_16)
+    self_encode = false;
 #endif
 
-    if (desired_bit_depth >= SHM_BITS_10 && pixman_fmt == PIXMAN_a8r8g8b8) {
-        if (wayl->shm_have_argb2101010) {
-            pixman_fmt = PIXMAN_a2r10g10b10;
-            shm_fmt = WL_SHM_FORMAT_ARGB2101010;
+    if (self_encode) {
+#if defined(HAVE_PIXMAN_RGBA_16)
+        static bool have_logged_self_encode = false;
 
+        pixman_fmt = PIXMAN_a16b16g16r16;
+        present_fmt = PIXMAN_a8r8g8b8;
+        shm_fmt = WL_SHM_FORMAT_ARGB8888;
+
+        if (!have_logged_self_encode) {
+            have_logged_self_encode = true;
+            LOG_INFO("using 16-bit linear render buffers with self-encoded "
+                     "8-bit sRGB surfaces");
+        }
+#endif
+    } else {
+
+#if defined(HAVE_PIXMAN_RGBA_16)
+        static bool have_logged_16_fallback = false;
+
+        if (desired_bit_depth == SHM_BITS_16) {
+            if (wayl->shm_have_abgr161616) {
+                pixman_fmt = PIXMAN_a16b16g16r16;
+                shm_fmt = WL_SHM_FORMAT_ABGR16161616;
+
+                if (!have_logged) {
+                    have_logged = true;
+                    LOG_INFO("using 16-bit BGR surfaces");
+                }
+            } else {
+                if (!have_logged_16_fallback) {
+                    have_logged_16_fallback = true;
+
+                    LOG_WARN(
+                        "16-bit surfaces requested, but compositor does not "
+                        "implement ABGR161616+XBGR161616");
+                }
+            }
+        }
+#endif
+
+        if (desired_bit_depth >= SHM_BITS_10 && pixman_fmt == PIXMAN_a8r8g8b8) {
+            if (wayl->shm_have_argb2101010) {
+                pixman_fmt = PIXMAN_a2r10g10b10;
+                shm_fmt = WL_SHM_FORMAT_ARGB2101010;
+
+                if (!have_logged) {
+                    have_logged = true;
+                    LOG_INFO("using 10-bit RGB surfaces");
+                }
+            }
+
+            else if (wayl->shm_have_abgr2101010) {
+                pixman_fmt = PIXMAN_a2b10g10r10;
+                shm_fmt = WL_SHM_FORMAT_ABGR2101010;
+
+                if (!have_logged) {
+                    have_logged = true;
+                    LOG_INFO("using 10-bit BGR surfaces");
+                }
+            }
+
+            else {
+                if (!have_logged_10_fallback) {
+                    have_logged_10_fallback = true;
+
+                    LOG_WARN(
+                        "10-bit surfaces requested, but compositor does not "
+                        "implement ARGB2101010+XRGB2101010, or "
+                        "ABGR2101010+XBGR2101010");
+                }
+            }
+        } else  {
             if (!have_logged) {
                 have_logged = true;
-                LOG_INFO("using 10-bit RGB surfaces");
+                LOG_INFO("using 8-bit RGB surfaces");
             }
-        }
-
-        else if (wayl->shm_have_abgr2101010) {
-            pixman_fmt = PIXMAN_a2b10g10r10;
-            shm_fmt = WL_SHM_FORMAT_ABGR2101010;
-
-            if (!have_logged) {
-                have_logged = true;
-                LOG_INFO("using 10-bit BGR surfaces");
-            }
-        }
-
-        else {
-            if (!have_logged_10_fallback) {
-                have_logged_10_fallback = true;
-
-                LOG_WARN(
-                    "10-bit surfaces requested, but compositor does not "
-                    "implement ARGB2101010+XRGB2101010, or "
-                    "ABGR2101010+XBGR2101010");
-            }
-        }
-    } else  {
-        if (!have_logged) {
-            have_logged = true;
-            LOG_INFO("using 8-bit RGB surfaces");
         }
     }
 
@@ -1070,7 +1119,9 @@ shm_chain_new(struct wayland *wayl, bool scrollable, size_t pix_instances,
         .pix_instances = pix_instances,
         .scrollable = scrollable,
 
+        .self_encode = self_encode,
         .pixman_fmt = pixman_fmt,
+        .present_fmt = present_fmt,
         .shm_format = shm_fmt,
 
         .release_cb = release_cb,
@@ -1107,4 +1158,73 @@ shm_chain_bit_depth(const struct buffer_chain *chain)
             ? SHM_BITS_16
 #endif
         : SHM_BITS_10;
+}
+
+#if defined(HAVE_PIXMAN_RGBA_16)
+static void
+encode_span(const uint64_t *src, uint32_t *dst, int n)
+{
+    for (int x = 0; x < n; x++) {
+        const uint64_t px = src[x];
+        const uint32_t r = (uint16_t)px;
+        const uint32_t g = (uint16_t)(px >> 16);
+        const uint32_t b = (uint16_t)(px >> 32);
+        const uint32_t a = (uint16_t)(px >> 48);
+
+        uint32_t r8, g8, b8;
+        const uint32_t a8 = a >> 8;
+
+        if (likely(a == 0xffff)) {
+            r8 = srgb_encode_16_to_8(r);
+            g8 = srgb_encode_16_to_8(g);
+            b8 = srgb_encode_16_to_8(b);
+        } else if (a == 0) {
+            r8 = g8 = b8 = 0;
+        } else {
+            /* Un-premultiply (linear) -> encode -> re-premultiply (sRGB) */
+            uint32_t ur = r * 0xffffu / a; ur = ur > 0xffff ? 0xffff : ur;
+            uint32_t ug = g * 0xffffu / a; ug = ug > 0xffff ? 0xffff : ug;
+            uint32_t ub = b * 0xffffu / a; ub = ub > 0xffff ? 0xffff : ub;
+            r8 = (srgb_encode_16_to_8(ur) * a8 + 127) / 255;
+            g8 = (srgb_encode_16_to_8(ug) * a8 + 127) / 255;
+            b8 = (srgb_encode_16_to_8(ub) * a8 + 127) / 255;
+        }
+
+        dst[x] = (a8 << 24) | (r8 << 16) | (g8 << 8) | b8;
+    }
+}
+#endif
+
+void
+shm_encode_present(struct buffer *buf, const pixman_region32_t *region)
+{
+#if defined(HAVE_PIXMAN_RGBA_16)
+    if (buf->present_data == NULL)
+        return;
+
+    pixman_box32_t whole = {0, 0, buf->width, buf->height};
+    int n_rects = 1;
+    const pixman_box32_t *rects = &whole;
+
+    if (region != NULL)
+        rects = pixman_region32_rectangles((pixman_region32_t *)region, &n_rects);
+
+    for (int i = 0; i < n_rects; i++) {
+        const int x1 = max(0, rects[i].x1);
+        const int y1 = max(0, rects[i].y1);
+        const int x2 = min(buf->width, rects[i].x2);
+        const int y2 = min(buf->height, rects[i].y2);
+
+        for (int y = y1; y < y2; y++) {
+            const uint64_t *src =
+                (const uint64_t *)((const uint8_t *)buf->data + (size_t)y * buf->stride) + x1;
+            uint32_t *dst =
+                (uint32_t *)((uint8_t *)buf->present_data + (size_t)y * buf->present_stride) + x1;
+            encode_span(src, dst, x2 - x1);
+        }
+    }
+#else
+    (void)buf;
+    (void)region;
+#endif
 }

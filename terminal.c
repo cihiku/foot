@@ -1267,6 +1267,13 @@ term_init(const struct config *conf, struct fdm *fdm, struct reaper *reaper,
         goto err;
     }
 
+    const bool self_encode =
+#if defined(HAVE_PIXMAN_RGBA_16)
+        conf->gamma_correct;
+#else
+        false;
+#endif
+
     const enum shm_bit_depth desired_bit_depth =
         conf->tweak.surface_bit_depth == SHM_BITS_AUTO
             ? wayl_do_linear_blending(wayl, conf) ? SHM_BITS_16 : SHM_BITS_8
@@ -1364,13 +1371,13 @@ term_init(const struct config *conf, struct fdm *fdm, struct reaper *reaper,
         .render = {
             .chains = {
                 .grid = shm_chain_new(wayl, true, 1 + conf->render_worker_count,
-                                      desired_bit_depth, &render_buffer_release_callback, term),
-                .search = shm_chain_new(wayl, false, 1 ,desired_bit_depth, NULL, NULL),
-                .scrollback_indicator = shm_chain_new(wayl, false, 1, desired_bit_depth, NULL, NULL),
-                .render_timer = shm_chain_new(wayl, false, 1, desired_bit_depth, NULL, NULL),
-                .url = shm_chain_new(wayl, false, 1, desired_bit_depth, NULL, NULL),
-                .csd = shm_chain_new(wayl, false, 1, desired_bit_depth, NULL, NULL),
-                .overlay = shm_chain_new(wayl, false, 1, desired_bit_depth, NULL, NULL),
+                                      desired_bit_depth, self_encode, &render_buffer_release_callback, term),
+                .search = shm_chain_new(wayl, false, 1 ,desired_bit_depth, self_encode, NULL, NULL),
+                .scrollback_indicator = shm_chain_new(wayl, false, 1, desired_bit_depth, self_encode, NULL, NULL),
+                .render_timer = shm_chain_new(wayl, false, 1, desired_bit_depth, self_encode, NULL, NULL),
+                .url = shm_chain_new(wayl, false, 1, desired_bit_depth, self_encode, NULL, NULL),
+                .csd = shm_chain_new(wayl, false, 1, desired_bit_depth, self_encode, NULL, NULL),
+                .overlay = shm_chain_new(wayl, false, 1, desired_bit_depth, self_encode, NULL, NULL),
             },
             .scrollback_lines = conf->scrollback.lines,
             .app_sync_updates.timer_fd = app_sync_updates_fd,

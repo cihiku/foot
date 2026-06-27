@@ -25,6 +25,9 @@ struct buffer {
     pixman_image_t **pix;
     size_t pix_instances;
 
+    void *present_data;
+    int present_stride;
+
     unsigned age;
 
     /*
@@ -50,11 +53,13 @@ void shm_set_min_stride_alignment(size_t min_stride_alignment);
 struct buffer_chain;
 struct buffer_chain *shm_chain_new(
     struct wayland *wayl, bool scrollable, size_t pix_instances,
-    enum shm_bit_depth desired_bit_depth,
+    enum shm_bit_depth desired_bit_depth, bool self_encode,
     void (*release_cb)(struct buffer *buf, void *data), void *cb_data);
 void shm_chain_free(struct buffer_chain *chain);
 
 enum shm_bit_depth shm_chain_bit_depth(const struct buffer_chain *chain);
+
+void shm_encode_present(struct buffer *buf, const pixman_region32_t *region);
  
 /*
  * Returns a single buffer.
